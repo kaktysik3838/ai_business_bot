@@ -2,6 +2,7 @@ import os
 import html
 import asyncio
 import logging
+import imaplib
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -31,6 +32,8 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+MAX_ADVICE_LEN = 3500
+
 
 # ----------------- СОСТОЯНИЯ FSM -----------------
 
@@ -45,6 +48,29 @@ class EmailSetup(StatesGroup):
     imap_server = State()
     email_login = State()
     email_password = State()
+
+
+# ----------------- ХЕЛПЕРЫ -----------------
+
+def safe_advice(advice: str) -> str:
+    """Обрезает совет, чтобы Telegram не ругался на длину сообщения (>4096)."""
+    if not advice:
+        return "—"
+    if len(advice) <= MAX_ADVICE_LEN:
+        return advice
+    return advice[:MAX_ADVICE_LEN] + "\n…(сокращено)"
+
+
+def _check_imap_sync(server: str, login: str, password: str) -> None:
+    """Синхронная проверка IMAP-логина. Кидает исключение при ошибке."""
+    imap = imaplib.IMAP4_SSL(server, timeout=10)
+    try:
+        imap.login(login, password)
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
 
 
 # ----------------- КЛАВИАТУРЫ И ТЕКСТЫ -----------------
@@ -86,7 +112,7 @@ INSTRUCTION_TEXT = """
 
 <b>3. Как связать бота с Электронной Почтой (Email):</b>
 • Нажмите кнопку <b>«📧 Настроить Почту»</b> ниже (или введите <code>/setup_email</code>).
-• Укажите IMAP-сервер (<code>imap.yandex.ru</code>, <code>imap.mail.ru</code>, <code>://gmail.com</code>), ваш Email и пароль приложения.
+• Укажите IMAP-сервер (<code>imap.yandex.ru</code>, <code>imap.mail.ru</code>, <code>imap.gmail.com</code>), ваш Email и пароль приложения.
 • Бот будет проверять почту каждые 2 минуты, дублировать входящие письма сюда и сразу писать совет по ответу!
 
 <b>4. Как общаться с ботом и ставить задачи:</b>
@@ -213,7 +239,7 @@ async def cmd_setup_email(message: Message, state: FSMContext):
         "Отправьте адрес IMAP-сервера вашей почты:\n"
         "• Яндекс: <code>imap.yandex.ru</code>\n"
         "• Mail.ru: <code>imap.mail.ru</code>\n"
-        "• Gmail: <code>://gmail.com</code>\n\n"
+        "• Gmail: <code>imap.gmail.com</code>\n\n"
         "<i>Для отмены нажмите /cancel</i>",
         parse_mode="HTML"
     )
@@ -229,7 +255,10 @@ async def cb_setup_email(call: CallbackQuery, state: FSMContext):
 async def email_step_server(message: Message, state: FSMContext):
     await state.update_data(imap_server=message.text.strip())
     await state.set_state(EmailSetup.email_login)
-    await message.answer("📧 <b>Шаг 2/3:</b> Введите ваш полный Email-адрес (например, <code>info@company.ru</code>):", parse_mode="HTML")
+    await message.answer(
+        "📧 <b>Шаг 2/3:</b> Введите ваш полный Email-адрес (например, <code>info@company.ru</code>):",
+        parse_mode="HTML"
+    )
 
 
 @dp.message(EmailSetup.email_login, F.text)
@@ -246,13 +275,41 @@ async def email_step_login(message: Message, state: FSMContext):
 @dp.message(EmailSetup.email_password, F.text)
 async def email_step_pass(message: Message, state: FSMContext):
     data = await state.get_data()
+    server = data["imap_server"]
+    login = data["email_login"]
+    password = message.text.strip()
+
+    # Проверяем IMAP в отдельном потоке, чтобы не блокировать event loop
+    try:
+        await asyncio.to_thread(_check_imap_sync, server, login, password)
+    except imaplib.IMAP4.error as e:
+        await message.answer(
+            f"❌ Не удалось войти в почту.\n"
+            f"<b>Ответ сервера:</b> <code>{html.escape(str(e))}</code>\n\n"
+            f"Проверьте логин и пароль приложения. "
+            f"Отправьте пароль ещё раз — попробуем снова.",
+            parse_mode="HTML"
+        )
+        return
+    except (OSError, TimeoutError) as e:
+        await message.answer(
+            f"❌ Не удалось подключиться к <code>{html.escape(server)}</code>.\n"
+            f"<b>Ошибка:</b> <code>{html.escape(str(e))}</code>\n\n"
+            f"Проверьте, что IMAP-сервер указан верно (например, <code>imap.yandex.ru</code>). "
+            f"Отправьте пароль ещё раз — попробуем снова.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Всё ок — сохраняем
     await db.save_user_email(
         user_id=message.from_user.id,
-        imap_server=data["imap_server"],
-        login=data["email_login"],
-        password=message.text.strip()
+        imap_server=server,
+        login=login,
+        password=password
     )
-    # Удаляем сообщение с паролем из чата для безопасности
+
+    # Удаляем сообщение с паролем из чата
     try:
         await message.delete()
     except Exception:
@@ -267,258 +324,316 @@ async def email_step_pass(message: Message, state: FSMContext):
     )
 
 
-Используйте код с осторожностью.
-
------------------ 3. УПРАВЛЕНИЕ ЗАДАЧАМИ И КНОПКАМИ -----------------
+# ----------------- 3. УПРАВЛЕНИЕ ЗАДАЧАМИ И КНОПКАМИ -----------------
 
 @dp.message(Command("tasks"))
 async def cmd_tasks_list(message: Message):
-await send_tasks_list(message.from_user.id, message)
+    await send_tasks_list(message.from_user.id, message)
+
+
 @dp.callback_query(F.data == "menu_tasks")
 async def cb_tasks_list(call: CallbackQuery):
-await call.answer()
-await send_tasks_list(call.from_user.id, call.message)
+    await call.answer()
+    await send_tasks_list(call.from_user.id, call.message)
+
+
 async def send_tasks_list(user_id: int, message_obj: Message):
-pending = await db.get_tasks(user_id, status="pending")
-completed = await db.get_tasks(user_id, status="completed")
-text = "📋 Ваши задачи на текущий момент:\n\n"
-kb_rows = []
-if pending:
-text += "⏳ Нерешенные дела (нажмите на кнопку ниже, чтобы отметить решенным):\n"
-for i, t in enumerate(pending, 1):
-title_safe = html.escape(t["title"])
-due_safe = html.escape(t["due_time"] or "утром")
-text += f"{i}. {title_safe} ({due_safe})\n"
-short_btn = t["title"][:28] + ("..." if len(t["title"]) > 28 else "")
-kb_rows.append([
-InlineKeyboardButton(text=f"✅ Выполнено: {short_btn}", callback_data=f"done_{t['id']}")
-])
-text += "\n"
-else:
-text += "⏳ Нерешенных задач сейчас нет.\n\n"
-if completed:
-text += "✅ Выполнено за сегодня (пойдет в вечерний отчет):\n"
-for t in completed:
-text += f"• {html.escape(t['title'])}\n"
-kb_rows.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu_back")])
-await message_obj.answer(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    pending = await db.get_tasks(user_id, status="pending")
+    completed = await db.get_tasks(user_id, status="completed")
+
+    text = "📋 Ваши задачи на текущий момент:\n\n"
+    kb_rows = []
+
+    if pending:
+        text += "⏳ Нерешенные дела (нажмите на кнопку ниже, чтобы отметить решенным):\n"
+        for i, t in enumerate(pending, 1):
+            title_safe = html.escape(t["title"])
+            due_safe = html.escape(t["due_time"] or "утром")
+            text += f"{i}. {title_safe} ({due_safe})\n"
+            short_btn = t["title"][:28] + ("..." if len(t["title"]) > 28 else "")
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"✅ Выполнено: {short_btn}",
+                    callback_data=f"done_{t['id']}"
+                )
+            ])
+        text += "\n"
+    else:
+        text += "⏳ Нерешенных задач сейчас нет.\n\n"
+
+    if completed:
+        text += "✅ Выполнено за сегодня (пойдет в вечерний отчет):\n"
+        for t in completed:
+            text += f"• {html.escape(t['title'])}\n"
+
+    kb_rows.append([InlineKeyboardButton(text="🔙 В главное меню", callback_data="menu_back")])
+
+    await message_obj.answer(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    )
+
+
 @dp.callback_query(F.data.startswith("done_"))
 async def cb_complete_task(call: CallbackQuery):
-task_id = int(call.data.split("_")[1])
-await db.complete_task_by_id(task_id, call.from_user.id)
-await call.answer("Задача отмечена как решенная! ✅")
-await send_tasks_list(call.from_user.id, call.message)
+    task_id = int(call.data.split("_")[1])
+    await db.complete_task_by_id(task_id, call.from_user.id)
+    await call.answer("Задача отмечена как решенная! ✅")
+    await send_tasks_list(call.from_user.id, call.message)
+
+
 @dp.callback_query(F.data == "menu_back")
 async def cb_back_main(call: CallbackQuery):
-await call.answer()
-await call.message.answer("Главное меню управления ассистентом:", reply_markup=get_main_inline_menu())
+    await call.answer()
+    await call.message.answer(
+        "Главное меню управления ассистентом:",
+        reply_markup=get_main_inline_menu()
+    )
+
+
 @dp.callback_query(F.data == "menu_help")
 async def cb_help(call: CallbackQuery):
-await call.answer()
-await call.message.answer(INSTRUCTION_TEXT, parse_mode="HTML", reply_markup=get_main_inline_menu())
+    await call.answer()
+    await call.message.answer(
+        INSTRUCTION_TEXT,
+        parse_mode="HTML",
+        reply_markup=get_main_inline_menu()
+    )
+
+
 @dp.callback_query(F.data == "menu_morning")
 async def cb_morning_test(call: CallbackQuery):
-await call.answer("Формирую утреннюю сводку...")
-await morning_digest(bot)
+    await call.answer("Формирую утреннюю сводку...")
+    await morning_digest(bot, user_id=call.from_user.id)
+
+
 @dp.callback_query(F.data == "menu_evening")
 async def cb_evening_test(call: CallbackQuery):
-await call.answer("Формирую вечерний отчет...")
-await evening_digest(bot)
+    await call.answer("Формирую вечерний отчет...")
+    await evening_digest(bot, user_id=call.from_user.id)
+
+
 @dp.callback_query(F.data == "menu_check_mail")
 async def cb_check_mail_now(call: CallbackQuery):
-await call.answer("Проверяю почтовый ящик...")
-await check_all_users_email(bot)
-await call.message.answer("🔄 Проверка почты завершена (если были новые непрочитанные письма, они отправлены выше).")
+    await call.answer("Проверяю почтовый ящик...")
+    await check_all_users_email(bot)
+    await call.message.answer(
+        "🔄 Проверка почты завершена (если были новые непрочитанные письма, они отправлены выше)."
+    )
+
+
 @dp.message(Command("morning"))
 async def cmd_test_morning(message: Message):
-await morning_digest(bot)
+    await morning_digest(bot, user_id=message.from_user.id)
+
+
 @dp.message(Command("evening"))
 async def cmd_test_evening(message: Message):
-await evening_digest(bot)
+    await evening_digest(bot, user_id=message.from_user.id)
 
------------------ 4. ПРИВЯЗКА ГРУППОВЫХ ЧАТОВ -----------------
+
+# ----------------- 4. ПРИВЯЗКА ГРУППОВЫХ ЧАТОВ -----------------
 
 @dp.message(Command("link"))
 async def cmd_link_group(message: Message):
-if message.chat.type == "private":
-await message.answer("Эту команду нужно написать внутри группового чата, куда вы добавили бота!")
-return
-user = await db.get_user(message.from_user.id)
-if not user:
-await message.answer("Сначала настройте свой профиль у меня в личных сообщениях через команду /start")
-return
-title = message.chat.title or "Рабочая группа"
-await db.link_group_chat(message.chat.id, message.from_user.id, title)
-await message.answer(
-f"✅ Групповой чат «{html.escape(title)}» привязан к руководителю {html.escape(user['name'])}!\n"
-"Теперь я анализирую переписку и отправляю уведомления с советами по ответу вам в личные сообщения.",
-parse_mode="HTML"
-)
+    if message.chat.type == "private":
+        await message.answer("Эту команду нужно написать внутри группового чата, куда вы добавили бота!")
+        return
 
------------------ 5. TELEGRAM BUSINESS (ПЕРЕХВАТ ЛИЧНЫХ СООБЩЕНИЙ) -----------------
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Сначала настройте свой профиль у меня в личных сообщениях через команду /start")
+        return
+
+    title = message.chat.title or "Рабочая группа"
+    await db.link_group_chat(message.chat.id, message.from_user.id, title)
+    await message.answer(
+        f"✅ Групповой чат «{html.escape(title)}» привязан к руководителю {html.escape(user['name'])}!\n"
+        "Теперь я анализирую переписку и отправляю уведомления с советами по ответу вам в личные сообщения.",
+        parse_mode="HTML"
+    )
+
+
+# ----------------- 5. TELEGRAM BUSINESS (ПЕРЕХВАТ ЛИЧНЫХ СООБЩЕНИЙ) -----------------
 
 @dp.business_connection()
 async def handle_business_connect(connection: BusinessConnection):
-await db.save_business_connection(connection.user.id, connection.id)
-try:
-await bot.send_message(
-connection.user.id,
-"✅ Telegram Business успешно подключен!\n"
-"Теперь, когда вам напишут в личные сообщения, я пришлю сюда дубликат текста и совет от ИИ, как лучше ответить.",
-parse_mode="HTML"
-)
-except Exception as e:
-logging.error(f"Ошибка уведомления Business Connection: {e}")
+    await db.save_business_connection(connection.user.id, connection.id)
+    try:
+        await bot.send_message(
+            connection.user.id,
+            "✅ Telegram Business успешно подключен!\n"
+            "Теперь, когда вам напишут в личные сообщения, я пришлю сюда дубликат текста и совет от ИИ, как лучше ответить.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка уведомления Business Connection: {e}")
+
+
 @dp.business_message(F.text)
 async def handle_incoming_business_msg(message: Message):
-owner = await db.get_user_by_business_conn(message.business_connection_id)
-if not owner:
-return
-# Не реагируем на сообщения, которые отправляет сам владелец аккаунта
-if message.from_user and message.from_user.id == owner["user_id"]:
-return
-sender_name = message.from_user.full_name if message.from_user else "Собеседник"
-if message.from_user and message.from_user.username:
-sender_name += f" (@{message.from_user.username})"
-advice = await generate_reply_advice(
-user=owner,
-source_name="Личное сообщение в Telegram",
-sender=sender_name,
-incoming_text=message.text
-)
-alert = (
-    f"💬 <b>Новое личное сообщение в Telegram</b>\n"
-    f"👤 <b>От кого:</b> {html.escape(sender_name)}\n\n"
-    f"📩 <b>Текст сообщения:</b>\n"
-    f"{html.escape(message.text)}\n\n"
-    f"💡 <b>Совет ИИ по ответу</b> <i>(тапни по блоку, чтобы скопировать):</i>\n"
-    f"<pre>{html.escape(advice)}</pre>"
-)
-try:
-await bot.send_message(owner["user_id"], alert, parse_mode="HTML")
-except Exception as e:
-logging.error(f"Ошибка отправки бизнес-уведомления: {e}")
+    owner = await db.get_user_by_business_conn(message.business_connection_id)
+    if not owner:
+        return
 
------------------ 6. ОБРАБОТКА ВСЕХ СООБЩЕНИЙ (ГРУППЫ И ЛИЧНЫЙ ЧАТ С БОТОМ) -----------------
+    # Не реагируем на сообщения, которые отправляет сам владелец аккаунта
+    if message.from_user and message.from_user.id == owner["user_id"]:
+        return
+
+    sender_name = message.from_user.full_name if message.from_user else "Собеседник"
+    if message.from_user and message.from_user.username:
+        sender_name += f" (@{message.from_user.username})"
+
+    advice = await generate_reply_advice(
+        user=owner,
+        source_name="Личное сообщение в Telegram",
+        sender=sender_name,
+        incoming_text=message.text or ""
+    )
+
+    alert = (
+        f"💬 <b>Новое личное сообщение в Telegram</b>\n"
+        f"👤 <b>От кого:</b> {html.escape(sender_name)}\n\n"
+        f"📩 <b>Текст сообщения:</b>\n"
+        f"{html.escape(message.text or '')}\n\n"
+        f"💡 <b>Совет ИИ по ответу</b> <i>(тапни по блоку, чтобы скопировать):</i>\n"
+        f"<pre>{html.escape(safe_advice(advice))}</pre>"
+    )
+
+    try:
+        await bot.send_message(owner["user_id"], alert, parse_mode="HTML")
+    except Exception as e:
+        logging.error(f"Ошибка отправки бизнес-уведомления: {e}")
+
+
+# ----------------- 6. ОБРАБОТКА ВСЕХ СООБЩЕНИЙ (ГРУППЫ И ЛИЧНЫЙ ЧАТ С БОТОМ) -----------------
 
 @dp.message(F.text)
 async def handle_all_text(message: Message):
-# А) Если кто-то написал в привязанную рабочую группу
-if message.chat.type in ("group", "supergroup"):
-owner = await db.get_chat_owner(message.chat.id)
-if not owner or (message.from_user and message.from_user.id == owner["user_id"]):
-return
-sender_name = message.from_user.full_name if message.from_user else "Участник"
-if message.from_user and message.from_user.username:
-sender_name += f" (@{message.from_user.username})"
-chat_title = message.chat.title or "Рабочая группа"
-advice = await generate_reply_advice(
-user=owner,
-source_name=f"Групповой чат «{chat_title}»",
-sender=sender_name,
-incoming_text=message.text
-)
-alert = (
-    f"👥 <b>Новое сообщение в чате</b> «{html.escape(chat_title)}»\n"
-    f"👤 <b>От кого:</b> {html.escape(sender_name)}\n\n"
-    f"📩 <b>Текст сообщения:</b>\n"
-    f"{html.escape(message.text)}\n\n"
-    f"💡 <b>Совет ИИ по ответу</b> <i>(тапни, чтобы скопировать):</i>\n"
-    f"<pre>{html.escape(advice)}</pre>"
-)
-try:
-await bot.send_message(owner["user_id"], alert, parse_mode="HTML")
-except Exception as e:
-logging.error(f"Ошибка отправки уведомления из группы: {e}")
-return
-# Б) Если пользователь общается напрямую с ботом в личке
-user = await db.get_user(message.from_user.id)
-if not user:
-await message.answer("Пожалуйста, нажмите /start для начальной настройки вашего профиля.")
-return
-# Если пользователь переслал боту чужое сообщение — сразу даем совет по ответу
-if message.forward_Origin or message.forward_from or message.forward_sender_name:
-sender_label = message.forward_sender_name or (
-message.forward_from.full_name if message.forward_from else "Клиент / Собеседник"
-)
-advice = await generate_reply_advice(
-user=user,
-source_name="Пересланное сообщение",
-sender=sender_label,
-incoming_text=message.text
-)
-await message.answer(
-    f"📨 <b>Анализ пересланного сообщения от</b> {html.escape(sender_label)}\n\n"
-    f"💡 <b>Совет ИИ по ответу</b> <i>(тапни, чтобы скопировать):</i>\n"
-    f"<pre>{html.escape(advice)}</pre>",
-    parse_mode="HTML"
-)
-return
-# Обычный диалог с контекстом и распознаванием задач («напомни утром...» / «я сделал...»)
-result = await process_owner_message(user, message.text)
-if result.action == "create_task" and result.task_title:
-due = result.due_time or "утром"
-await db.add_task(
-user_id=user["user_id"],
-title=result.task_title,
-due_time=due,
-status="pending"
-)
-await message.answer(
-f"📌 Задача добавлена в утренний список:\n"
-f"• Дело: {html.escape(result.task_title)}\n"
-f"• Когда: {html.escape(due)}\n\n"
-f"{html.escape(result.reply_text)}",
-parse_mode="HTML",
-reply_markup=get_main_inline_menu()
-)
-elif result.action == "complete_task" and result.task_title:
-await db.add_task(
-user_id=user["user_id"],
-title=result.task_title,
-due_time="сегодня",
-status="completed"
-)
-await message.answer(
-f"✅ Записано в выполненные задачи за день:\n"
-f"• {html.escape(result.task_title)}\n\n"
-f"{html.escape(result.reply_text)}",
-parse_mode="HTML",
-reply_markup=get_main_inline_menu()
-)
-else:
-await message.answer(html.escape(result.reply_text), parse_mode="HTML")
+    # А) Если кто-то написал в привязанную рабочую группу
+    if message.chat.type in ("group", "supergroup"):
+        owner = await db.get_chat_owner(message.chat.id)
+        if not owner or (message.from_user and message.from_user.id == owner["user_id"]):
+            return
 
------------------ ЗАПУСК БОТА -----------------
+        sender_name = message.from_user.full_name if message.from_user else "Участник"
+        if message.from_user and message.from_user.username:
+            sender_name += f" (@{message.from_user.username})"
+
+        chat_title = message.chat.title or "Рабочая группа"
+        advice = await generate_reply_advice(
+            user=owner,
+            source_name=f"Групповой чат «{chat_title}»",
+            sender=sender_name,
+            incoming_text=message.text or ""
+        )
+
+        alert = (
+            f"👥 <b>Новое сообщение в чате</b> «{html.escape(chat_title)}»\n"
+            f"👤 <b>От кого:</b> {html.escape(sender_name)}\n\n"
+            f"📩 <b>Текст сообщения:</b>\n"
+            f"{html.escape(message.text or '')}\n\n"
+            f"💡 <b>Совет ИИ по ответу</b> <i>(тапни, чтобы скопировать):</i>\n"
+            f"<pre>{html.escape(safe_advice(advice))}</pre>"
+        )
+
+        try:
+            await bot.send_message(owner["user_id"], alert, parse_mode="HTML")
+        except Exception as e:
+            logging.error(f"Ошибка отправки уведомления из группы: {e}")
+        return
+
+    # Б) Если пользователь общается напрямую с ботом в личке
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Пожалуйста, нажмите /start для начальной настройки вашего профиля.")
+        return
+
+    # Если пользователь переслал боту чужое сообщение — сразу даём совет по ответу
+    if message.forward_origin:
+        origin = message.forward_origin
+        if origin.type == "user":
+            sender_label = origin.sender_user.full_name
+        elif origin.type == "hidden_user":
+            sender_label = origin.sender_user_name
+        else:
+            sender_label = "Клиент / Собеседник"
+
+        advice = await generate_reply_advice(
+            user=user,
+            source_name="Пересланное сообщение",
+            sender=sender_label,
+            incoming_text=message.text or ""
+        )
+        await message.answer(
+            f"📨 <b>Анализ пересланного сообщения от</b> {html.escape(sender_label)}\n\n"
+            f"💡 <b>Совет ИИ по ответу</b> <i>(тапни, чтобы скопировать):</i>\n"
+            f"<pre>{html.escape(safe_advice(advice))}</pre>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Обычный диалог с контекстом и распознаванием задач
+    result = await process_owner_message(user, message.text)
+
+    if result.action == "create_task" and result.task_title:
+        due = result.due_time or "утром"
+        await db.add_task(
+            user_id=user["user_id"],
+            title=result.task_title,
+            due_time=due,
+            status="pending"
+        )
+        await message.answer(
+            f"📌 Задача добавлена в утренний список:\n"
+            f"• Дело: {html.escape(result.task_title)}\n"
+            f"• Когда: {html.escape(due)}\n\n"
+            f"{html.escape(result.reply_text)}",
+            parse_mode="HTML",
+            reply_markup=get_main_inline_menu()
+        )
+    elif result.action == "complete_task" and result.task_title:
+        await db.add_task(
+            user_id=user["user_id"],
+            title=result.task_title,
+            due_time="сегодня",
+            status="completed"
+        )
+        await message.answer(
+            f"✅ Записано в выполненные задачи за день:\n"
+            f"• {html.escape(result.task_title)}\n\n"
+            f"{html.escape(result.reply_text)}",
+            parse_mode="HTML",
+            reply_markup=get_main_inline_menu()
+        )
+    else:
+        await message.answer(html.escape(result.reply_text), parse_mode="HTML")
+
+
+# ----------------- ЗАПУСК БОТА -----------------
 
 async def set_bot_commands(bot_instance: Bot):
-commands = [
-BotCommand(command="start", description="Главное меню / Анкета"),
-BotCommand(command="tasks", description="Список задач и отметка выполнения"),
-BotCommand(command="setup_email", description="Подключить электронную почту"),
-BotCommand(command="morning", description="Получить утренний план сейчас"),
-BotCommand(command="evening", description="Получить вечерний отчет сейчас"),
-BotCommand(command="help", description="Инструкция по подключению чатов"),
-BotCommand(command="cancel", description="Отменить ввод")
-]
-await bot_instance.set_my_commands(commands)
+    commands = [
+        BotCommand(command="start", description="Главное меню / Анкета"),
+        BotCommand(command="tasks", description="Список задач и отметка выполнения"),
+        BotCommand(command="setup_email", description="Подключить электронную почту"),
+        BotCommand(command="morning", description="Получить утренний план сейчас"),
+        BotCommand(command="evening", description="Получить вечерний отчет сейчас"),
+        BotCommand(command="help", description="Инструкция по подключению чатов"),
+        BotCommand(command="cancel", description="Отменить ввод")
+    ]
+    await bot_instance.set_my_commands(commands)
+
+
 async def main():
-await db.init_db()
-await set_bot_commands(bot)
-scheduler = setup_scheduler(bot)
-scheduler.start()
-logging.info("🚀 Бот-ассистент запущен и готов к работе!")
-await dp.start_polling(bot)
-if name == "main":
-asyncio.run(main())
+    await db.init_db()
+    await set_bot_commands(bot)
+    scheduler = setup_scheduler(bot)
+    scheduler.start()
+    logging.info("🚀 Бот-ассистент запущен и готов к работе!")
+    await dp.start_polling(bot)
 
-### Что улучшено в этой версии `bot.py`:
-* **Кнопочная панель управления (`InlineKeyboardMarkup`):** После прохождения анкеты пользователю открывается интерактивное меню (список задач, привязка почты, ручная проверка писем, тест утренней и вечерней сводки, инструкция).
-* **Закрытие задач в один клик:** По команде `/tasks` (или кнопке «📋 Мои задачи») выводится список дел, где под каждой задачей есть кнопка `✅ Выполнено` — нажатие сразу переносит её в вечерний отчет.
-* **Автоматический разбор пересланных сообщений:** Если просто переслать (Forward) боту любое сообщение от клиента или сотрудника, он сразу напишет совет по ответу.
-* **Защита от ошибок разметки (`html.escape`):** Если нейросеть или отправитель письма использует символы `<`, `>` или `&`, бот не выдаст ошибку парсинга Telegram HTML.
-* **Безопасность пароля почты:** Как только пользователь отправляет пароль от IMAP, бот сохраняет его в БД и сразу удаляет сообщение с паролем из истории чата.
 
-<FollowUp>
-Нужно ли также обновить **`scheduler.py`**, чтобы кнопки быстрого закрытия задач (`✅ Выполнено`) приходили прямо внутри **утреннего уведомления в 09:00**?
-</FollowUp>
+if __name__ == "__main__":
+    asyncio.run(main())
